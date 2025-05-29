@@ -1,6 +1,7 @@
 package workerd
 
 import (
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -44,7 +45,15 @@ type AsynqConfig struct {
 	RedisClient RedisClient `json:"redisClient" yaml:"redisClient" required:"true"`
 }
 
-func (a *AsynqConfig) GetRedisClientOpt() *asynq.RedisClientOpt {
+func (a *AsynqConfig) GetRedisClientOpt() (*asynq.RedisClientOpt, error) {
+	if a == nil {
+		return nil, fmt.Errorf("AsynqConfig is nil")
+	}
+
+	if err := a.validate(); err != nil {
+		return nil, fmt.Errorf("invalid asynq configuration: %w", err)
+	}
+
 	return &asynq.RedisClientOpt{
 		Network:      a.RedisClient.Network,
 		Addr:         a.RedisClient.Addr,
@@ -55,7 +64,33 @@ func (a *AsynqConfig) GetRedisClientOpt() *asynq.RedisClientOpt {
 		ReadTimeout:  a.RedisClient.ReadTimeout,
 		WriteTimeout: a.RedisClient.WriteTimeout,
 		PoolSize:     a.RedisClient.PoolSize,
+	}, nil
+}
+
+// validate validates the AsynqConfig and its RedisClient configuration
+func (a *AsynqConfig) validate() error {
+	if a.RedisClient.Addr == "" {
+		return fmt.Errorf("redis address cannot be empty")
 	}
+	if a.RedisClient.Network == "" {
+		return fmt.Errorf("redis network cannot be empty")
+	}
+	if a.RedisClient.DB < 0 {
+		return fmt.Errorf("redis DB must be non-negative, got %d", a.RedisClient.DB)
+	}
+	if a.RedisClient.PoolSize <= 0 {
+		return fmt.Errorf("redis pool size must be positive, got %d", a.RedisClient.PoolSize)
+	}
+	if a.RedisClient.DialTimeout <= 0 {
+		return fmt.Errorf("redis dial timeout must be positive, got %v", a.RedisClient.DialTimeout)
+	}
+	if a.RedisClient.ReadTimeout <= 0 {
+		return fmt.Errorf("redis read timeout must be positive, got %v", a.RedisClient.ReadTimeout)
+	}
+	if a.RedisClient.WriteTimeout <= 0 {
+		return fmt.Errorf("redis write timeout must be positive, got %v", a.RedisClient.WriteTimeout)
+	}
+	return nil
 }
 
 // workerConfig defines the workers's settings
@@ -82,10 +117,43 @@ func newWorkerConfig(files ...string) (*workerConfig, error) {
 		ErrorOnUnmatchedKeys: true,
 	})
 
-	err := configorInstance.Load(config, files...)
-	if err != nil {
-		return nil, err
+	if len(files) > 0 {
+		if err := configorInstance.Load(config, files...); err != nil {
+			return nil, fmt.Errorf("failed to load configuration from files %v: %w", files, err)
+		}
+	} else {
+		// Load from environment variables only
+		if err := configorInstance.Load(config); err != nil {
+			return nil, fmt.Errorf("failed to load configuration from environment: %w", err)
+		}
+	}
+
+	// Validate loaded configuration
+	if err := validateWorkerConfig(config); err != nil {
+		return nil, fmt.Errorf("configuration validation failed: %w", err)
 	}
 
 	return config, nil
+}
+
+// validateWorkerConfig validates the workerConfig
+func validateWorkerConfig(config *workerConfig) error {
+	if config == nil {
+		return fmt.Errorf("config cannot be nil")
+	}
+	
+	if config.AsynqConfig == nil {
+		return fmt.Errorf("asynq configuration is required")
+	}
+
+	if config.Concurrency < 0 {
+		return fmt.Errorf("concurrency must be non-negative, got %d", config.Concurrency)
+	}
+
+	// Validate asynq config
+	if err := config.AsynqConfig.validate(); err != nil {
+		return fmt.Errorf("asynq configuration invalid: %w", err)
+	}
+
+	return nil
 }

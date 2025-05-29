@@ -11,10 +11,8 @@ import (
 	"github.com/paulgrammer/workerd"
 )
 
-var Build string
-
 func main() {
-	serviceFlag := flag.String("service", "", "Control the system service (install, uninstall, start, stop, restart, run)")
+	serviceFlag := flag.String("service", "run", "Control the system service (install, uninstall, start, stop, restart, run)")
 	configPath := flag.String("config", "", "Path to either a file or directory to load configuration from")
 	name := flag.String("name", "workerd", "Service name")
 	displayName := flag.String("display-name", "Workerd Service", "Service display name")

@@ -155,25 +155,6 @@ func (w *Workerd) HandleFunc(pattern string, handler func(context.Context, *asyn
 func (w *Workerd) Handle(pattern string, handler asynq.Handler)
 ```
 
-#### Lifecycle Management
-
-```go
-// Run in appropriate mode (standalone or service)
-func (w *Workerd) Run() error
-
-// Start in standalone mode
-func (w *Workerd) StartStandalone()
-
-// Start as system service
-func (w *Workerd) StartAsService() error
-
-// Stop gracefully
-func (w *Workerd) Stop()
-
-// Get logger instance
-func (w *Workerd) GetLogger() *slog.Logger
-```
-
 ## Command Line Interface
 
 ### Flags
@@ -187,7 +168,6 @@ func (w *Workerd) GetLogger() *slog.Logger
 | `-description` | string | Service description |
 | `-concurrency` | int | Number of concurrent workers |
 | `-help` | bool | Print usage information |
-| `-version` | bool | Print version information |
 
 ### Service Commands
 

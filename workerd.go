@@ -1,11 +1,8 @@
 package workerd
 
 import (
-	"flag"
 	"fmt"
-	"log"
 	"log/slog"
-	"os"
 	"strings"
 
 	"github.com/hibiken/asynq"
@@ -24,7 +21,7 @@ type Workerd struct {
 	displayName string
 	description string
 	concurrency int
-	logger      service.Logger
+	errorChan   chan error
 }
 
 // === Functional Option Type ===
@@ -108,8 +105,38 @@ func splitConfigPath(configPath string) []string {
 	return strings.Split(configPath, ",")
 }
 
+// initializeComponents initializes the logger, ServeMux, and asynq server
+func (w *Workerd) initializeComponents(config *workerConfig) error {
+	if config == nil {
+		return fmt.Errorf("config cannot be nil")
+	}
+
+	// Initialize logger if not provided
+	if w.log == nil {
+		w.log = newLogger(config.LogLevel)
+	}
+
+	// Initialize ServeMux if not provided
+	if w.ServeMux == nil {
+		w.ServeMux = asynq.NewServeMux()
+	}
+
+	// Initialize asynq server using ServerBuilder
+	serverBuilder, err := NewServerBuilder(config)
+	if err != nil {
+		return fmt.Errorf("failed to create server builder: %w", err)
+	}
+
+	w.srv, err = serverBuilder.BuildServer(w.concurrency)
+	if err != nil {
+		return fmt.Errorf("failed to build asynq server: %w", err)
+	}
+
+	return nil
+}
+
 // === Constructor ===
-func NewWorkerd(opts ...Option) *Workerd {
+func NewWorkerd(opts ...Option) (*Workerd, error) {
 	w := &Workerd{
 		name:        "workerd",
 		displayName: "Workerd Service",
@@ -119,42 +146,68 @@ func NewWorkerd(opts ...Option) *Workerd {
 
 	// Apply functional options
 	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
 		opt(w)
 	}
 
-	// Load config
-	config, err := newWorkerConfig(splitConfigPath(w.configPath)...)
+	// Extract options into WorkerdOptions struct
+	options := &WorkerdOptions{
+		Name:        w.name,
+		DisplayName: w.displayName,
+		Description: w.description,
+		Concurrency: w.concurrency,
+		Logger:      w.log,
+		ConfigPath:  w.configPath,
+		ServiceFlag: w.serviceFlag,
+	}
+
+	// Load configuration
+	fileConfig, err := newWorkerConfig(splitConfigPath(w.configPath)...)
 	if err != nil {
-		slog.Error("Failed to load config", "error", err)
-		os.Exit(1)
-	}
-	w.config = config
-
-	// Apply config values if not set via options
-	if w.name == "" && config.Name != "" {
-		w.name = config.Name
-	}
-	if w.displayName == "" && config.DisplayName != "" {
-		w.displayName = config.DisplayName
-	}
-	if w.description == "" && config.Description != "" {
-		w.description = config.Description
-	}
-	if w.concurrency <= 0 && config.Concurrency > 0 {
-		w.concurrency = config.Concurrency
-	}
-	if w.log == nil {
-		w.log = newLogger(config.LogLevel)
-	}
-	if w.ServeMux == nil {
-		w.ServeMux = asynq.NewServeMux()
+		return nil, fmt.Errorf("failed to load worker config: %w", err)
 	}
 
-	w.srv = asynq.NewServer(config.AsynqConfig.GetRedisClientOpt(),
-		asynq.Config{Concurrency: w.concurrency},
-	)
+	// Create default configuration
+	defaultConfig := &workerConfig{
+		Name:        "workerd",
+		DisplayName: "Workerd Service",
+		Description: "Background worker service",
+		Concurrency: 10,
+	}
 
-	return w
+	// Merge configurations using ConfigMerger
+	merger := NewConfigMerger().
+		WithDefaults(defaultConfig).
+		WithFileConfig(fileConfig).
+		WithOptions(options)
+
+	mergedConfig, err := merger.Merge()
+	if err != nil {
+		return nil, fmt.Errorf("failed to merge configurations: %w", err)
+	}
+
+	// Apply merged configuration to workerd instance
+	w.name = mergedConfig.Name
+	w.displayName = mergedConfig.DisplayName
+	w.description = mergedConfig.Description
+	w.concurrency = mergedConfig.Concurrency
+	w.configPath = mergedConfig.ConfigPath
+	w.serviceFlag = mergedConfig.ServiceFlag
+	w.config = mergedConfig.Config
+
+	// Use provided logger or create default
+	if mergedConfig.Logger != nil {
+		w.log = mergedConfig.Logger
+	}
+
+	// Initialize components
+	if err := w.initializeComponents(mergedConfig.Config); err != nil {
+		return nil, fmt.Errorf("failed to initialize components: %w", err)
+	}
+
+	return w, nil
 }
 
 // GetLogger returns the logger instance
@@ -162,127 +215,14 @@ func (w *Workerd) GetLogger() *slog.Logger {
 	return w.log
 }
 
-// newService starts the workerd as a system service
-func (w *Workerd) newService() (service.Service, error) {
-	svcConfig := &service.Config{
-		Name:        w.name,
-		DisplayName: w.displayName,
-		Description: w.description,
-		Arguments:   []string{"-service", "run"},
-	}
-
-	if w.configPath != "" {
-		svcConfig.Arguments = append(svcConfig.Arguments, "-config", w.configPath)
-	}
-
-	s, err := service.New(w, svcConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create service: %w", err)
-	}
-
-	// Setup service logger
-	errs := make(chan error, 5)
-	w.logger, err = s.Logger(errs)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create service logger: %w", err)
-	}
-
-	// Start error logging goroutine
-	go w.logServiceErrors(errs)
-
-	return s, nil
-}
-
-// HandleServiceControl handles service control commands
-func (w *Workerd) HandleServiceControl(s service.Service, action string) error {
-	switch action {
-	case "run":
-		err := s.Run()
-		if err != nil {
-			return fmt.Errorf("failed to run service: %w", err)
-		}
-	default:
-		err := service.Control(s, action)
-		if err != nil {
-			return fmt.Errorf("service control action '%s' failed: %w (valid actions: %q)",
-				action, err, service.ControlAction)
-		}
-	}
-
-	return nil
-}
-
 // Run is the main entry point that handles both service and standalone modes
 func (w *Workerd) Run() error {
-	// Initialize service
-	s, err := w.newService()
+	// Initialize service manager
+	serviceManager, err := NewServiceManager(w)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create service manager: %w", err)
 	}
 
 	// Handle service control
-	return w.HandleServiceControl(s, w.serviceFlag)
-}
-
-// logServiceErrors logs service errors
-func (w *Workerd) logServiceErrors(errs chan error) {
-	for {
-		err := <-errs
-		if err != nil {
-			log.Print(err)
-			if w.log != nil {
-				w.log.Error("Service error", "error", err)
-			}
-		}
-	}
-}
-
-// === CLI Integration ===
-
-// Run runs the workerd with command line interface with mux
-func Run(mux *asynq.ServeMux) {
-	serviceFlag := flag.String("service", "run", "Control the system service (install, uninstall, start, stop, restart, run)")
-	configPath := flag.String("config", "", "Path to either a file or directory to load configuration from")
-	name := flag.String("name", "", "Service name")
-	displayName := flag.String("display-name", "", "Service display name")
-	description := flag.String("description", "", "Service description")
-	concurrency := flag.Int("concurrency", 0, "Number of concurrent workers")
-	printUsage := flag.Bool("help", false, "Print command line usage")
-
-	flag.Parse()
-
-	if *printUsage {
-		flag.Usage()
-		os.Exit(0)
-	}
-
-	// Build options
-	opts := []Option{WithServeMux(mux)}
-
-	if *configPath != "" {
-		opts = append(opts, WithConfigPath(*configPath))
-	}
-	if *serviceFlag != "" {
-		opts = append(opts, WithServiceFlag(*serviceFlag))
-	}
-	if *name != "" {
-		opts = append(opts, WithName(*name))
-	}
-	if *displayName != "" {
-		opts = append(opts, WithDisplayName(*displayName))
-	}
-	if *description != "" {
-		opts = append(opts, WithDescription(*description))
-	}
-	if *concurrency > 0 {
-		opts = append(opts, WithConcurrency(*concurrency))
-	}
-
-	// Create and run workerd
-	workerd := NewWorkerd(opts...)
-
-	if err := workerd.Run(); err != nil {
-		fmt.Printf("Failed to run workerd: %v\n", err)
-		os.Exit(1)
-	}
+	return serviceManager.HandleControl(w.serviceFlag)
 }
